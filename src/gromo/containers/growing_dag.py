@@ -2,7 +2,7 @@ import copy
 import warnings
 from collections import deque
 from enum import Enum
-from typing import Any, Callable, Iterator, Mapping
+from typing import Any, Callable, Iterator, Literal, Mapping, TypeAlias
 
 import networkx as nx
 import torch
@@ -15,7 +15,11 @@ from gromo.modules.conv2d_growing_module import (
     FullConv2dGrowingModule,
 )
 from gromo.modules.growing_module import GrowingModule, MergeGrowingModule
-from gromo.modules.growing_normalisation import GrowingLayerNorm
+from gromo.modules.growing_normalisation import (
+    GrowingBatchNorm1d,
+    GrowingBatchNorm2d,
+    GrowingLayerNorm,
+)
 from gromo.modules.linear_growing_module import (
     LinearGrowingModule,
     LinearMergeGrowingModule,
@@ -31,6 +35,7 @@ from gromo.utils.utils import (
 
 
 supported_layer_types = ["linear", "convolution"]
+NormalizationType: TypeAlias = Literal["layer", "batch"]
 
 
 class GrowingDAG(nx.DiGraph, GrowingContainer):
@@ -46,10 +51,15 @@ class GrowingDAG(nx.DiGraph, GrowingContainer):
         number of neurons to add on each growth step
     use_bias : bool
         use bias
-    use_layer_norm : bool
-        use Layer Normalization
+    use_layer_norm : bool | None, optional
+        compatibility alias for requesting Layer Normalization. If set to
+        ``True``, it is equivalent to ``normalization="layer"``. If set to
+        ``False`` without an explicit ``normalization``, normalization is
+        disabled.
     default_layer_type : str, optional
         the type of layer operations, to choose between "linear" and "convolution", by default "linear"
+    normalization : {"layer", "batch"} | None, optional
+        normalization applied before node activation, by default None
     activation : str, optional
         the default activation function, by default "selu"
     kernel_size : tuple[int, int], optional
@@ -81,7 +91,7 @@ class GrowingDAG(nx.DiGraph, GrowingContainer):
         out_features: int,
         neurons: int,
         use_bias: bool,
-        use_layer_norm: bool,
+        use_layer_norm: bool | None = None,
         default_layer_type: str = "linear",
         activation: str = "selu",
         kernel_size: tuple[int, int] = (3, 3),
@@ -91,6 +101,7 @@ class GrowingDAG(nx.DiGraph, GrowingContainer):
         input_shape: tuple[int, int] | None = None,
         DAG_parameters: dict | None = None,
         device: torch.device | str | None = None,
+        normalization: NormalizationType | None = None,
     ) -> None:
         nx.DiGraph.__init__(self)
         GrowingContainer.__init__(
@@ -101,7 +112,12 @@ class GrowingDAG(nx.DiGraph, GrowingContainer):
         )
         self.neurons = neurons
         self.use_bias = use_bias
-        self.use_layer_norm = use_layer_norm
+        self.normalization = self._resolve_normalization(
+            normalization=normalization,
+            use_layer_norm=use_layer_norm,
+            subject="GrowingDAG normalization",
+        )
+        self.use_layer_norm = self.normalization == "layer"
         self.activation = activation
         self.kernel_size = kernel_size
         if "_" in name:
@@ -202,6 +218,59 @@ class GrowingDAG(nx.DiGraph, GrowingContainer):
         for node_module in self.get_all_node_modules():
             node_module.delete_update(include_previous=True)
 
+    @staticmethod
+    def _validate_normalization(
+        normalization: NormalizationType | None,
+    ) -> NormalizationType | None:
+        """Validate the normalization configuration."""
+        if normalization is None or normalization in {"layer", "batch"}:
+            return normalization
+        raise ValueError(
+            "normalization must be one of None, 'layer', or 'batch', "
+            f"got {normalization!r}."
+        )
+
+    @classmethod
+    def _resolve_normalization(
+        cls,
+        normalization: NormalizationType | None,
+        use_layer_norm: bool | None,
+        subject: str,
+    ) -> NormalizationType | None:
+        """Resolve the new normalization selector and the legacy alias."""
+        normalization = cls._validate_normalization(normalization)
+
+        if use_layer_norm is True:
+            if normalization in (None, "layer"):
+                return "layer"
+            raise ValueError(
+                f"{subject} is inconsistent: normalization={normalization!r} "
+                "is incompatible with use_layer_norm=True."
+            )
+
+        if use_layer_norm is False:
+            if normalization == "layer":
+                raise ValueError(
+                    f"{subject} is inconsistent: normalization='layer' "
+                    "is incompatible with use_layer_norm=False."
+                )
+            return normalization
+
+        return normalization
+
+    def _resolve_node_normalization(
+        self, node: str, attributes: dict[str, Any]
+    ) -> NormalizationType | None:
+        """Resolve a node normalization override against the DAG default."""
+        if "normalization" not in attributes and "use_layer_norm" not in attributes:
+            return self.normalization
+
+        return self._resolve_normalization(
+            normalization=attributes.get("normalization"),
+            use_layer_norm=attributes.get("use_layer_norm"),
+            subject=f"Normalization for node {node!r}",
+        )
+
     # Initialize GrowingDAG and properties
 
     def init_dag_parameters(self) -> dict:
@@ -219,6 +288,7 @@ class GrowingDAG(nx.DiGraph, GrowingContainer):
                 "size": self.in_features,
                 "shape": self.input_shape,
                 "kernel_size": self.kernel_size,
+                "normalization": None,
                 "use_layer_norm": False,
             },
             self.end: {
@@ -226,6 +296,7 @@ class GrowingDAG(nx.DiGraph, GrowingContainer):
                 "size": self.out_features,
                 "shape": self.input_shape,
                 "kernel_size": self.kernel_size,
+                "normalization": self.normalization,
                 "use_layer_norm": self.use_layer_norm,
             },
         }
@@ -257,7 +328,11 @@ class GrowingDAG(nx.DiGraph, GrowingContainer):
                 "shape": value.get("shape"),
                 "kernel_size": self.kernel_size,
                 "activation": self.activation if node != self.root else "id",
-                "use_layer_norm": self.use_layer_norm if node != self.root else False,
+                "normalization": value.get(
+                    "normalization",
+                    None if node == self.root else self.normalization,
+                ),
+                "use_layer_norm": value.get("normalization") == "layer",
             }
             for node, value in self.nodes.items()
         }
@@ -675,7 +750,7 @@ class GrowingDAG(nx.DiGraph, GrowingContainer):
             if the type of the node is invalid
         """
         for node in nodes:
-            attributes = node_attributes.get(node, {})
+            attributes = copy.copy(node_attributes.get(node, {}))
             if "type" not in attributes:
                 raise KeyError(
                     'The type of the node should be specified at initialization. Example: key "type" in node_attributes[new_node]'
@@ -685,17 +760,26 @@ class GrowingDAG(nx.DiGraph, GrowingContainer):
                     'The size of the node should be specified at initialization. Example: key "size" in node_attributes[new_node]'
                 )
 
+            normalization = self._resolve_node_normalization(node, attributes)
             self.nodes[node].update(attributes)
+            self.nodes[node]["normalization"] = normalization
+            self.nodes[node]["use_layer_norm"] = normalization == "layer"
 
-            layer_norm = nn.Identity()
+            normalization_layer: nn.Module = nn.Identity()
 
             name = node.split("_")[0]
             if self.nodes[node]["type"] == "linear":
                 in_features = self.nodes[node]["size"]
 
-                if attributes.get("use_layer_norm", self.use_layer_norm):
-                    layer_norm = GrowingLayerNorm(
+                if normalization == "layer":
+                    normalization_layer = GrowingLayerNorm(
                         in_features, elementwise_affine=False, device=self.device
+                    )
+                elif normalization == "batch":
+                    normalization_layer = GrowingBatchNorm1d(
+                        in_features,
+                        affine=True,
+                        device=self.device,
                     )
 
                 self.__set_node_module(
@@ -703,7 +787,7 @@ class GrowingDAG(nx.DiGraph, GrowingContainer):
                     LinearMergeGrowingModule(
                         in_features=in_features,
                         post_merge_function=torch.nn.Sequential(
-                            layer_norm,
+                            normalization_layer,
                             activation_fn(self.nodes[node].get("activation")),
                         ),
                         allow_growing=True,
@@ -713,7 +797,8 @@ class GrowingDAG(nx.DiGraph, GrowingContainer):
                 )
             elif self.nodes[node]["type"] == "convolution":
                 in_channels = self.nodes[node]["size"]
-                input_size = self.nodes[node].get("shape", (1, 1))
+                node_shape = self.nodes[node].get("shape")
+                input_size = node_shape if node_shape is not None else (1, 1)
                 kernel_size = self.nodes[node]["kernel_size"]
                 input_volume = (
                     in_channels * input_size[0] * input_size[1]
@@ -721,14 +806,20 @@ class GrowingDAG(nx.DiGraph, GrowingContainer):
                     else None
                 )
 
-                if attributes.get("use_layer_norm", self.use_layer_norm):
-                    if "shape" not in attributes:
+                if normalization == "layer":
+                    if node_shape is None:
                         raise KeyError(
                             'The shape of the input (h,w) should be specified at initialization when using LayerNorm. Example: key "shape" in node_attributes[new_node]'
                         )
-                    layer_norm = GrowingLayerNorm(
+                    normalization_layer = GrowingLayerNorm(
                         [in_channels, *input_size],
                         elementwise_affine=False,
+                        device=self.device,
+                    )
+                elif normalization == "batch":
+                    normalization_layer = GrowingBatchNorm2d(
+                        in_channels,
+                        affine=True,
                         device=self.device,
                     )
 
@@ -740,7 +831,7 @@ class GrowingDAG(nx.DiGraph, GrowingContainer):
                         next_kernel_size=kernel_size,
                         input_volume=input_volume,
                         post_merge_function=torch.nn.Sequential(
-                            layer_norm,
+                            normalization_layer,
                             activation_fn(self.nodes[node].get("activation")),
                         ),
                         allow_growing=True,

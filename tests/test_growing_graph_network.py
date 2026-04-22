@@ -24,6 +24,7 @@ except ImportError:
 
 class TestGrowingGraphNetwork(TorchTestCase):
     def setUp(self) -> None:
+        super().setUp()
         self.in_features = 3
         self.out_features = 2
         self.batch_size = 8
@@ -141,7 +142,54 @@ class TestGrowingGraphNetwork(TorchTestCase):
         self.assertEqual(self.net.dag.nodes[self.net.dag.end]["size"], self.out_features)
         self.assertEqual(self.net.dag.nodes[self.net.dag.root]["type"], "linear")
         self.assertEqual(self.net.dag.nodes[self.net.dag.end]["type"], "linear")
+        self.assertIsNone(self.net.dag.nodes[self.net.dag.end]["normalization"])
         self.assertFalse(self.net.dag.nodes[self.net.dag.end]["use_layer_norm"])
+
+    def test_normalization_configuration(self) -> None:
+        batch_net = GrowingGraphNetwork(
+            in_features=self.in_features,
+            out_features=self.out_features,
+            neurons=self.neurons,
+            loss_fn=torch.nn.CrossEntropyLoss(),
+            layer_type="linear",
+            normalization="batch",
+        )
+        self.assertEqual(batch_net.normalization, "batch")
+        self.assertFalse(batch_net.use_layer_norm)
+        self.assertEqual(batch_net.dag.normalization, "batch")
+        self.assertEqual(batch_net.dag.nodes[batch_net.dag.end]["normalization"], "batch")
+        self.assertIsInstance(
+            batch_net.dag.get_node_module(batch_net.dag.end).post_merge_function[0],
+            torch.nn.BatchNorm1d,
+        )
+        self.assertTrue(
+            batch_net.dag.get_node_module(batch_net.dag.end).post_merge_function[0].affine
+        )
+
+        layer_net = GrowingGraphNetwork(
+            in_features=self.in_features,
+            out_features=self.out_features,
+            neurons=self.neurons,
+            loss_fn=torch.nn.CrossEntropyLoss(),
+            layer_type="linear",
+            use_layer_norm=True,
+        )
+        self.assertEqual(layer_net.normalization, "layer")
+        self.assertTrue(layer_net.use_layer_norm)
+        self.assertEqual(layer_net.dag.normalization, "layer")
+        self.assertEqual(layer_net.dag.nodes[layer_net.dag.end]["normalization"], "layer")
+        self.assertTrue(layer_net.dag.nodes[layer_net.dag.end]["use_layer_norm"])
+
+        with self.assertRaises(ValueError):
+            GrowingGraphNetwork(
+                in_features=self.in_features,
+                out_features=self.out_features,
+                neurons=self.neurons,
+                loss_fn=torch.nn.CrossEntropyLoss(),
+                layer_type="linear",
+                normalization="batch",
+                use_layer_norm=True,
+            )
 
     def test_expand_node(self) -> None:
         node = "1"

@@ -103,6 +103,59 @@ class TestGrowingDAG(TorchTestCase):
         self.assertEqual(dag.ancestors, {})
         self.assertEqual(len(dag._growing_layers), 0)
 
+    def test_normalization_configuration(self) -> None:
+        layer_dag = GrowingDAG(
+            in_features=self.in_features,
+            out_features=self.out_features,
+            neurons=self.hidden_size,
+            use_bias=self.use_bias,
+            use_layer_norm=True,
+            default_layer_type="linear",
+        )
+        self.assertEqual(layer_dag.normalization, "layer")
+        self.assertTrue(layer_dag.use_layer_norm)
+        self.assertEqual(layer_dag.nodes[layer_dag.end]["normalization"], "layer")
+
+        batch_dag = GrowingDAG(
+            in_features=self.in_features,
+            out_features=self.out_features,
+            neurons=self.hidden_size,
+            use_bias=self.use_bias,
+            default_layer_type="linear",
+            normalization="batch",
+        )
+        self.assertEqual(batch_dag.normalization, "batch")
+        self.assertFalse(batch_dag.use_layer_norm)
+        self.assertEqual(batch_dag.nodes[batch_dag.end]["normalization"], "batch")
+        self.assertIsInstance(
+            batch_dag.get_node_module(batch_dag.end).post_merge_function[0],
+            torch.nn.BatchNorm1d,
+        )
+        self.assertTrue(
+            batch_dag.get_node_module(batch_dag.end).post_merge_function[0].affine
+        )
+
+        with self.assertRaises(ValueError):
+            GrowingDAG(
+                in_features=self.in_features,
+                out_features=self.out_features,
+                neurons=self.hidden_size,
+                use_bias=self.use_bias,
+                default_layer_type="linear",
+                normalization="invalid",  # type: ignore[arg-type]
+            )
+
+        with self.assertRaises(ValueError):
+            GrowingDAG(
+                in_features=self.in_features,
+                out_features=self.out_features,
+                neurons=self.hidden_size,
+                use_bias=self.use_bias,
+                use_layer_norm=True,
+                default_layer_type="linear",
+                normalization="batch",
+            )
+
     def test_edge_candidate(self) -> None:
         with self.assertRaises(ValueError):
             # Edge not present in the graph
@@ -297,8 +350,14 @@ class TestGrowingDAG(TorchTestCase):
         self.assertEqual(len(self.dag.get_node_module(new_node).previous_modules), 0)
         self.assertEqual(len(self.dag.get_node_module(new_node).next_modules), 0)
 
-        node_attributes[new_node]["use_layer_norm"] = True
-        self.dag.update_nodes(nodes=[new_node], node_attributes=node_attributes)
+        layer_node_attributes = {
+            new_node: {
+                "type": "linear",
+                "size": self.hidden_size,
+                "use_layer_norm": True,
+            }
+        }
+        self.dag.update_nodes(nodes=[new_node], node_attributes=layer_node_attributes)
         self.assertIsInstance(
             self.dag.get_node_module(new_node).post_merge_function[0],
             torch.nn.LayerNorm,
@@ -307,16 +366,103 @@ class TestGrowingDAG(TorchTestCase):
             self.dag.get_node_module(new_node).post_merge_function[0].normalized_shape,
             (self.hidden_size,),
         )
+        self.assertEqual(self.dag.nodes[new_node]["normalization"], "layer")
+        self.assertTrue(self.dag.nodes[new_node]["use_layer_norm"])
+
+        batch_node_attributes = {
+            new_node: {
+                "type": "linear",
+                "size": self.hidden_size,
+                "normalization": "batch",
+            }
+        }
+        self.dag.update_nodes(nodes=[new_node], node_attributes=batch_node_attributes)
+        self.assertIsInstance(
+            self.dag.get_node_module(new_node).post_merge_function[0],
+            torch.nn.BatchNorm1d,
+        )
+        self.assertTrue(self.dag.get_node_module(new_node).post_merge_function[0].affine)
+        self.assertEqual(self.dag.nodes[new_node]["normalization"], "batch")
+        self.assertFalse(self.dag.nodes[new_node]["use_layer_norm"])
 
         self.dag_conv.add_edges_from(edges)
-        node_attributes[new_node]["type"] = "convolution"
-        node_attributes[new_node]["kernel_size"] = self.dag_conv.kernel_size
+        conv_layer_attributes = {
+            new_node: {
+                "type": "convolution",
+                "size": self.hidden_size,
+                "kernel_size": self.dag_conv.kernel_size,
+                "use_layer_norm": True,
+            }
+        }
         with self.assertRaises(KeyError):
             # The shape of the input (h,w) should be specified in convolution with LayerNorm
-            self.dag_conv.update_nodes(nodes=[new_node], node_attributes=node_attributes)
+            self.dag_conv.update_nodes(
+                nodes=[new_node], node_attributes=conv_layer_attributes
+            )
 
-        node_attributes[new_node]["shape"] = (3, 3)
-        self.dag_conv.update_nodes(nodes=[new_node], node_attributes=node_attributes)
+        conv_layer_attributes[new_node]["shape"] = (3, 3)
+        self.dag_conv.update_nodes(nodes=[new_node], node_attributes=conv_layer_attributes)
+        self.assertIsInstance(
+            self.dag_conv.get_node_module(new_node).post_merge_function[0],
+            torch.nn.LayerNorm,
+        )
+
+        batch_conv_node = "new_batch"
+        batch_conv_edges = [
+            (self.dag_conv.root, batch_conv_node),
+            (batch_conv_node, self.dag_conv.end),
+        ]
+        self.dag_conv.add_edges_from(batch_conv_edges)
+        conv_batch_attributes = {
+            batch_conv_node: {
+                "type": "convolution",
+                "size": self.hidden_size,
+                "kernel_size": self.dag_conv.kernel_size,
+                "normalization": "batch",
+            }
+        }
+        self.dag_conv.update_nodes(
+            nodes=[batch_conv_node], node_attributes=conv_batch_attributes
+        )
+        self.assertIsInstance(
+            self.dag_conv.get_node_module(batch_conv_node).post_merge_function[0],
+            torch.nn.BatchNorm2d,
+        )
+        self.assertTrue(
+            self.dag_conv.get_node_module(batch_conv_node).post_merge_function[0].affine
+        )
+        self.assertEqual(self.dag_conv.nodes[batch_conv_node]["normalization"], "batch")
+        self.assertFalse(self.dag_conv.nodes[batch_conv_node]["use_layer_norm"])
+
+    def test_export_dag_parameters_preserves_node_normalization(self) -> None:
+        dag = GrowingDAG(
+            in_features=self.in_features,
+            out_features=self.out_features,
+            neurons=self.hidden_size,
+            use_bias=self.use_bias,
+            default_layer_type="linear",
+            normalization="batch",
+        )
+        dag.add_node_with_two_edges(
+            dag.root,
+            "1",
+            dag.end,
+            node_attributes={
+                "type": "linear",
+                "size": self.hidden_size,
+                "use_layer_norm": True,
+            },
+        )
+
+        dag_parameters = dag.export_dag_parameters()
+        self.assertIsNone(dag_parameters["node_attributes"][dag.root]["normalization"])
+        self.assertFalse(dag_parameters["node_attributes"][dag.root]["use_layer_norm"])
+        self.assertEqual(
+            dag_parameters["node_attributes"][dag.end]["normalization"], "batch"
+        )
+        self.assertFalse(dag_parameters["node_attributes"][dag.end]["use_layer_norm"])
+        self.assertEqual(dag_parameters["node_attributes"]["1"]["normalization"], "layer")
+        self.assertTrue(dag_parameters["node_attributes"]["1"]["use_layer_norm"])
 
     def test_update_edges(self) -> None:
         start, end = self.dag.root, self.dag.end
