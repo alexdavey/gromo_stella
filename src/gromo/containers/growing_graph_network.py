@@ -626,9 +626,10 @@ class GrowingGraphNetwork(GrowingContainer):
                 )
             next_edge_module.scaling_factor = 1  # type: ignore
 
-            expansion.metrics["block_output"][next_edge_module.next_module._name] = (
-                new_block_output[:, i : i + out_features, ...]
-            )
+            next_node_module = next_edge_module.next_module or next_edge_module
+            expansion.metrics["block_output"][next_node_module._name] = new_block_output[
+                :, i : i + out_features, ...
+            ]
 
             _weight = omega[i : i + out_features, ...]
             _weight = _weight.view(

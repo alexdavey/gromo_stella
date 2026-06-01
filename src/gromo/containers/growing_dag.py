@@ -2266,12 +2266,12 @@ class InterMergeExpansion(Expansion):
             return previous_nodes
 
     @property
-    def next_nodes(self) -> list[MergeGrowingModule]:
+    def next_nodes(self) -> list[MergeGrowingModule | GrowingModule]:
         """Get list of next node modules of the expansion
 
         Returns
         -------
-        list[MergeGrowingModule]
+        list[MergeGrowingModule | GrowingModule]
             next node modules
         """
         if self.type == ExpansionType.NEW_EDGE or self.type == ExpansionType.NEW_NODE:
@@ -2280,15 +2280,17 @@ class InterMergeExpansion(Expansion):
             next_nodes = []
             for edge in self.dag.get_node_module(self.expanding_node).next_modules:
                 if isinstance(edge, GrowingModule):
-                    if not self.dag.is_node_candidate(edge.next_module._name):
-                        next_nodes.append(edge.next_module)
+                    next_node = edge.next_module or edge
+                    if not self.dag.is_node_candidate(next_node._name):
+                        next_nodes.append(next_node)
                 elif isinstance(edge, MergeGrowingModule):
                     for next_edge in edge.next_modules:
+                        next_node = next_edge.next_module or next_edge
                         if (
-                            not self.dag.is_node_candidate(next_edge.next_module._name)
+                            not self.dag.is_node_candidate(next_node._name)
                             or self.expanding_node == self.dag.end
                         ):
-                            next_nodes.append(next_edge.next_module)
+                            next_nodes.append(next_node)
             return next_nodes
 
     @property
@@ -2319,13 +2321,15 @@ class InterMergeExpansion(Expansion):
                             new_edges.append(prev_edge)
             for edge in current_node_module.next_modules:
                 if isinstance(edge, GrowingModule):
-                    if not self.dag.is_node_candidate(edge.next_module._name):
+                    next_node = edge.next_module or edge
+                    if not self.dag.is_node_candidate(next_node._name):
                         new_edges.append(edge)
                 elif isinstance(edge, MergeGrowingModule):
                     for next_edge in edge.next_modules:
+                        next_node = next_edge.next_module or next_edge
                         if (
                             self.expanding_node == self.dag.end
-                        ) or not self.dag.is_node_candidate(next_edge.next_module._name):
+                        ) or not self.dag.is_node_candidate(next_node._name):
                             new_edges.append(next_edge)
             return new_edges
 
@@ -2375,13 +2379,15 @@ class InterMergeExpansion(Expansion):
             out_edges = []
             for edge in self.dag.get_node_module(self.expanding_node).next_modules:
                 if isinstance(edge, GrowingModule):
-                    if not self.dag.is_node_candidate(edge.next_module._name):
+                    next_node = edge.next_module or edge
+                    if not self.dag.is_node_candidate(next_node._name):
                         out_edges.append(edge)
                 elif isinstance(edge, MergeGrowingModule):
                     for next_edge in edge.next_modules:
+                        next_node = next_edge.next_module or next_edge
                         if (
                             self.expanding_node == self.dag.end
-                        ) or not self.dag.is_node_candidate(next_edge.next_module._name):
+                        ) or not self.dag.is_node_candidate(next_node._name):
                             out_edges.append(next_edge)
             return out_edges
 
